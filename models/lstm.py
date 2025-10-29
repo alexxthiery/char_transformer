@@ -1,6 +1,8 @@
 # write a LSTM cell using jax/flax
+# then implement a multi-layer LSTM model with token embeddings,
+# positional embeddings, stacked LSTM layers, and an output projection layer.
 
-import jax.numpy as jnp
+import jax.numpy as jnp 
 import flax.linen as nn
 from typing import Any, Callable, Optional, Tuple
 
@@ -17,8 +19,8 @@ class LSTMCell(nn.Module):
     hidden_size: int
 
     @nn.compact
-    def __call__(self, x, h_c):
-        h, c = h_c  # Unpack hidden state and cell state
+    def __call__(self, c_h, x):
+        c, h = c_h  # Unpack hidden state and cell state
         input_size = x.shape[-1]
 
         # Concatenate input and hidden state
@@ -38,36 +40,56 @@ class LSTMCell(nn.Module):
         new_c = f * c + i * g
         new_h = o * jnp.tanh(new_c)
 
-        return new_h, (new_h, new_c)  # Return new hidden state and (h, c) tuple
-    '''
-        # Pre-LayerNorm -> MLP -> Residual add
-        h = nn.LayerNorm()(x)
-        h = nn.Dense(self.hidden_size * 4)(h)
-        h = nn.gelu(h)
-        h = nn.Dense(self.hidden_size)(h)
-        return x + h  # Residual connection
-        '''
+        return (new_c, new_h), new_h  # Return new hidden state and (h, c) tuple
     
 class LSTM(nn.Module):
     """A multi-layer LSTM module.
 
-    Args:
-        hidden_size: The number of features in the hidden state h.
-        num_layers: Number of LSTM layers.
+    Components:
+      - Token embeddings: map token ids to D-dim vectors.
+      - Learned positional embeddings: adds position information (0..T-1).
+      - Stacked LSTM layers
+      - Output projection layer: maps hidden states to output logits.
     """
 
+    vocab_size: int
     hidden_size: int
     num_layers: int
+    max_length: int
 
     @nn.compact
-    def __call__(self, x, h_c):
-        for i in range(self.num_layers):
+    def __call__(self, x, initial_states=None):
+        B, T = x.shape  # Batch size and sequence length
+
+        # Token embeddings
+        token_emb = nn.Embed(self.vocab_size, self.hidden_size)(x)  # (B, T, D)
+
+        # Positional embeddings
+        pos_indices = jnp.arange(T)[None, :]  # (1, T)
+        pos_emb = nn.Embed(self.max_length, self.hidden_size)(pos_indices)  # (1, T, D)
+
+        h = token_emb + pos_emb  # (B, T, D)
+
+        # Initialize LSTM states if not provided
+        if initial_states is None:
+            initial_states = [
+                (jnp.zeros((B, self.hidden_size)), jnp.zeros((B, self.hidden_size)))
+                for _ in range(self.num_layers)
+            ]
+
+        # Stacked LSTM layers
+        states = initial_states
+        for layer_idx in range(self.num_layers):
             lstm_cell = LSTMCell(self.hidden_size)
-            x, h_c = lstm_cell(x, h_c)
-        return x, h_c  # Return final output and (h, c) tuple
-    
-# Example usage:
-# lstm = LSTM(hidden_size=128, num_layers=2)
-# h0 = jnp.zeros((batch_size, 128))
-# c0 = jnp.zeros((batch_size, 128))
-# output, (hn, cn) = lstm(input_data, (h0, c0))
+            new_states = []
+            outputs = []
+            for t in range(T):
+                (states[layer_idx], h_t) = lstm_cell(states[layer_idx], h[:, t, :])
+                outputs.append(h_t)
+            h = jnp.stack(outputs, axis=1)  # (B, T, D)
+            states[layer_idx] = states[layer_idx]
+
+        # Output projection layer
+        logits = nn.Dense(self.vocab_size)(h)  # (B, T, vocab_size)
+
+        return logits  # Return logits and final states
